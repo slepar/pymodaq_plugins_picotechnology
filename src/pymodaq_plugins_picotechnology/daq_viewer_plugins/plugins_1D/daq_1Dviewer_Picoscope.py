@@ -1,158 +1,485 @@
-import numpy as np
-from pymodaq.utils.daq_utils import ThreadCommand
-from pymodaq.utils.data import DataFromPlugins, Axis, DataToExport
+from qtpy.QtCore import Slot, QThread
 from pymodaq.control_modules.viewer_utility_classes import DAQ_Viewer_base, comon_parameters, main
-from pymodaq.utils.parameter import Parameter
+import numpy as np
+from easydict import EasyDict as edict
+from pymodaq.utils.daq_utils import ThreadCommand, getLineInfo
+from bitstring import BitArray
+from pymodaq.utils.data import Axis, DataFromPlugins
 
+import Picoscope as picoscope
 
-class PythonWrapperOfYourInstrument:
-    #  TODO Replace this fake class with the import of the real python wrapper of your instrument
-    pass
-
-# TODO:
-# (1) change the name of the following class to DAQ_1DViewer_TheNameOfYourChoice
-# (2) change the name of this file to daq_1Dviewer_TheNameOfYourChoice ("TheNameOfYourChoice" should be the SAME
-#     for the class name and the file name.)
-# (3) this file should then be put into the right folder, namely IN THE FOLDER OF THE PLUGIN YOU ARE DEVELOPING:
-#     pymodaq_plugins_my_plugin/daq_viewer_plugins/plugins_1D
-class DAQ_1DViewer_Template(DAQ_Viewer_base):
-    """ Instrument plugin class for a 1D viewer.
-    
-    This object inherits all functionalities to communicate with PyMoDAQ’s DAQ_Viewer module through inheritance via
-    DAQ_Viewer_base. It makes a bridge between the DAQ_Viewer module and the Python wrapper of a particular instrument.
-
-    TODO Complete the docstring of your plugin with:
-        * The set of instruments that should be compatible with this instrument plugin.
-        * With which instrument it has actually been tested.
-        * The version of PyMoDAQ during the test.
-        * The version of the operating system.
-        * Installation instructions: what manufacturer’s drivers should be installed to make it run?
-
-    Attributes:
-    -----------
-    controller: object
-        The particular object that allow the communication with the hardware, in general a python wrapper around the
-         hardware library.
-         
-    # TODO add your particular attributes here if any
-
+class DAQ_1DViewer_Picoscope(DAQ_Viewer_base):
     """
-    params = comon_parameters+[
-        ## TODO for your custom plugin
-        # elements to be added here as dicts in order to control your custom stage
-        ############
-        ]
+        ==================== ==============================
+        **Attributes**        **Type**
+        *hardware_averaging*  boolean
+        *params*              dictionnary list
+        *pico*                instance of Picoscope_5000A
+        *x_axis*              1D numpy array
+        *Nsample_available*   int
+        *buffers*             generic list
+        ==================== ==============================
+        See Also
+        --------
+        utility_classes.DAQ_Viewer_base
+    """
+    hardware_averaging=False
+    params= comon_parameters+[
+             {'title': 'Main Settings:','name': 'main_settings', 'type': 'group', 'children':[
+                {'title': 'Dynamic:','name': 'dynamic', 'type': 'list', 'limits': picoscope.DAQ_Picoscope_dynamic.names(), 'value': '12bits', 'default': '12bits'},
+                # {'title': 'Dynamic:','name': 'dynamic', 'type': 'list', 'limits': picoscope.DAQ_Picoscope_dynamic.names()},
+                {'title': 'N segments:','name': 'Nsegments', 'type': 'int', 'value': 1 , 'default': 1},
+                {'title': 'Temporal:','name': 'temporal', 'type': 'group', 'children':[
+                    {'title': 'Window (ms):','name': 'window', 'type': 'float', 'value': 100 , 'default': 100},
+                    {'title': 'N samples:','name': 'Nsamples', 'type': 'int', 'value': 4000 , 'default': 4000},
+                    {'title': 'Resolution (ms):','name': 'resolution', 'type': 'float', 'value': 0 , 'readonly': True},
+                    ]},
+                {'title': 'Trigger:','name': 'trigger', 'type': 'group', 'children':[
+                    {'title': 'Enable trigger:','name': 'trig_enabled', 'type': 'bool','value': True},
+                    {'title': 'Channel:','name': 'trig_channel', 'type': 'list','limits': picoscope.DAQ_Picoscope_trigger_channel.names()},
+                    {'title': 'Type:','name': 'trig_type', 'type': 'list', 'value': 'Rising_or_Falling', 'limits': picoscope.DAQ_Picoscope_trigger_type.names()},
+                    {'title': 'Level (V):','name': 'trig_level', 'type': 'float', 'value': 0.05, 'suffix': 'V'},
+                    {'title': 'Pretrigger (%):','name': 'trig_pretrigger', 'type': 'int', 'value': 50, 'suffix': '%'},
+                    {'title': 'Trigger delay (ms):','name': 'trig_delay', 'type': 'float', 'value': 0},
+                    {'title': 'Autotrigger delay (ms):','name': 'trig_autotrig', 'type': 'int', 'value': 100,},
+                    ]},
+                ]},
+            {'title': 'Channels:','name': 'channels', 'type': 'group', 'children':[
+                {'title': 'ChA:','name': 'ChA', 'type': 'group', 'children':[
+                        {'title': 'Active?:','name': 'active', 'type': 'bool','value': True},
+                        {'title': 'Range:','name': 'range', 'type': 'list','value': '200mV', 'limits': picoscope.DAQ_Picoscope_range.names()},
+                        {'title': 'Coupling:','name': 'coupling', 'type': 'list', 'limits': picoscope.DAQ_Picoscope_coupling.names(), 'value': 'DC', 'default': 'DC'},
+                        # {'title': 'Coupling:','name': 'coupling', 'type': 'list', 'limits': picoscope.DAQ_Picoscope_coupling.names()},
+                        {'title': 'Analog offset (V):','name': 'offset', 'type': 'float','value': 0},
+                        {'title': 'Overflow:','name': 'overflow', 'type': 'led','value': False},
+                ]},
+                {'title': 'ChB:','name': 'ChB', 'type': 'group', 'children':[
+                        {'title': 'Active?:','name': 'active', 'type': 'bool','value': False},
+                        {'title': 'Range:','name': 'range', 'type': 'list','value': '200mV', 'limits': picoscope.DAQ_Picoscope_range.names()},
+                        {'title': 'Coupling:','name': 'coupling', 'type': 'list', 'limits': picoscope.DAQ_Picoscope_coupling.names(), 'value': 'DC', 'default': 'DC'},
+                        {'title': 'Analog offset (V):','name': 'offset', 'type': 'float','value': 0},
+                        {'title': 'Overflow:','name': 'overflow', 'type': 'led','value': False},
+                ]},
+                {'title': 'ChC:','name': 'ChC', 'type': 'group', 'children':[
+                        {'title': 'Active?:','name': 'active', 'type': 'bool','value': False},
+                        {'title': 'Range:','name': 'range', 'type': 'list','value': '200mV', 'limits': picoscope.DAQ_Picoscope_range.names()},
+                        {'title': 'Coupling:','name': 'coupling', 'type': 'list', 'limits': picoscope.DAQ_Picoscope_coupling.names(), 'value': 'DC', 'default': 'DC'},
+                        {'title': 'Analog offset (V):','name': 'offset', 'type': 'float','value': 0},
+                        {'title': 'Overflow:','name': 'overflow', 'type': 'led','value': False},
+                ]},
+                {'title': 'ChD:','name': 'ChD', 'type': 'group', 'children':[
+                        {'title': 'Active?:','name': 'active', 'type': 'bool','value': False},
+                        {'title': 'Range:','name': 'range', 'type': 'list','value': '200mV', 'limits': picoscope.DAQ_Picoscope_range.names()},
+                        {'title': 'Coupling:','name': 'coupling', 'type': 'list', 'limits': picoscope.DAQ_Picoscope_coupling.names(), 'value': 'DC', 'default': 'DC'},
+                        {'title': 'Analog offset (V):','name': 'offset', 'type': 'float','value': 0},
+                        {'title': 'Overflow:','name': 'overflow', 'type': 'led','value': False},
+                ]},
+                {'title': 'ChE:','name': 'ChE', 'type': 'group', 'children':[
+                        {'title': 'Active?:','name': 'active', 'type': 'bool','value': False},
+                        {'title': 'Range:','name': 'range', 'type': 'list','value': '200mV', 'limits': picoscope.DAQ_Picoscope_range.names()},
+                        {'title': 'Coupling:','name': 'coupling', 'type': 'list', 'limits': picoscope.DAQ_Picoscope_coupling.names(), 'value': 'DC', 'default': 'DC'},
+                        {'title': 'Analog offset (V):','name': 'offset', 'type': 'float','value': 0},
+                        {'title': 'Overflow:','name': 'overflow', 'type': 'led','value': False},
+                ]},
+                {'title': 'ChF:','name': 'ChF', 'type': 'group', 'children':[
+                        {'title': 'Active?:','name': 'active', 'type': 'bool','value': False},
+                        {'title': 'Range:','name': 'range', 'type': 'list','value': '200mV', 'limits': picoscope.DAQ_Picoscope_range.names()},
+                        {'title': 'Coupling:','name': 'coupling', 'type': 'list', 'limits': picoscope.DAQ_Picoscope_coupling.names(), 'value': 'DC', 'default': 'DC'},
+                        {'title': 'Analog offset (V):','name': 'offset', 'type': 'float','value': 0},
+                        {'title': 'Overflow:','name': 'overflow', 'type': 'led','value': False},
+                ]},
+                {'title': 'ChG:','name': 'ChG', 'type': 'group', 'children':[
+                        {'title': 'Active?:','name': 'active', 'type': 'bool','value': False},
+                        {'title': 'Range:','name': 'range', 'type': 'list','value': '200mV', 'limits': picoscope.DAQ_Picoscope_range.names()},
+                        {'title': 'Coupling:','name': 'coupling', 'type': 'list', 'limits': picoscope.DAQ_Picoscope_coupling.names(), 'value': 'DC', 'default': 'DC'},
+                        {'title': 'Analog offset (V):','name': 'offset', 'type': 'float','value': 0},
+                        {'title': 'Overflow:','name': 'overflow', 'type': 'led','value': False},
+                ]},
+                {'title': 'ChH:','name': 'ChH', 'type': 'group', 'children':[
+                        {'title': 'Active?:','name': 'active', 'type': 'bool','value': False},
+                        {'title': 'Range:','name': 'range', 'type': 'list','value': '200mV', 'limits': picoscope.DAQ_Picoscope_range.names()},
+                        {'title': 'Coupling:','name': 'coupling', 'type': 'list', 'limits': picoscope.DAQ_Picoscope_coupling.names(), 'value': 'DC', 'default': 'DC'},
+                        {'title': 'Analog offset (V):','name': 'offset', 'type': 'float','value': 0},
+                        {'title': 'Overflow:','name': 'overflow', 'type': 'led','value': False},
+                ]}
+            ]},
+            ]
 
-    def ini_attributes(self):
-        #  TODO declare the type of the wrapper (and assign it to self.controller) you're going to use for easy
-        #  autocompletion
-        self.controller: PythonWrapperOfYourInstrument = None
+    def __init__(self,parent=None,params_state=None): #init_params is a list of tuple where each tuple contains info on a 1D channel (Ntps,amplitude, width, position and noise)
+        super(DAQ_1DViewer_Picoscope,self).__init__(parent,params_state)
+        self.pico=picoscope.Picoscope()
+        self.x_axis=None
+        self.Nsample_available=0
+        self.buffers=[]
 
-        # TODO declare here attributes you want/need to init with a default value
-
-        self.x_axis = None
-
-    def commit_settings(self, param: Parameter):
-        """Apply the consequences of a change of value in the detector settings
-
-        Parameters
-        ----------
-        param: Parameter
-            A given parameter (within detector_settings) whose value has been changed by the user
+    def get_active_channels(self):
         """
-        ## TODO for your custom plugin
-        if param.name() == "a_parameter_you've_added_in_self.params":
-           self.controller.your_method_to_apply_this_param_change()
-#        elif ...
-        ##
+            Get the active communications channels of the Picoscope 5000A.
+        """
+        return [child.name() for child in self.settings.child(('channels')) if child.child(('active')).value()]
+
+    def get_xaxis(self,Nsamples,time_window):
+        """
+            Get the current x_axis with Picoscope 5000A profile.
+
+            =============== ============= =================================
+            **Parameters**   **Type**      **Description**
+            *Nsamples*       int           The number of time axis samples
+            *time_window*    float/int ??  The time window full size
+            =============== ============= =================================
+
+            Returns
+            -------
+            (1D numpy array,int) tuple
+                The x_axis and his length couple.
+        """
+        time_inter_s=time_window*1e-6/(Nsamples)
+        status=self.pico.get_time_base(time_inter_s,Nsamples)
+        if status[0]!="PICO_OK":
+            raise Exception(status)
+        x_axis=status[2] #time in ms starting at 0
+        time_inter_ms=status[3]
+        pico_status,x_offset=self.pico.getTriggerTimeOffset()
+        if x_offset is None:
+            x_offset=0
+
+        x_axis=x_axis-x_offset## use ps5000aGetTriggerTimeOffset64
+        N_pre_trigger=int(self.Nsample_available*self.settings.child('main_settings','trigger','trig_pretrigger').value()/100)
+        x_axis=x_axis-time_inter_ms*N_pre_trigger
+        return x_axis,len(x_axis)
+
+    def commit_settings(self,param):
+        """
+            | Activate the parameters changes in the hardware.
+            | Disconnect the data ready signal to preserve correct transmission.
+            | 
+
+            The given parameter offer 5 differents profiles :
+                * **channels**  : Activate the channels update on the Picoscope 5000A
+                * **Nsegments** : Set segments on the Picoscope 5000A
+                * **trigger**   : Set the trig options on the Picoscope 5000A
+                * **temporal**  : Set number of samples and resolution of time on the Picoscope 5000A
+                * **dynamic**   : Set channels to dynamic range.
+
+            | 
+            | Send the data ready signal ance done.
+
+            =============== ================================ ==========================
+            **Parameters**   **Type**                        **Description**
+            *param*         instance of pyqtgraph.parameter  The parameter to activate
+            =============== ================================ ==========================     
+
+            See Also
+            --------
+            data_ready, get_active_channels, daq_utils.ThreadCommand, set_channels_to_dynamic_range, ini_detector, set_buffers
+        """
+        try:
+            self.pico.data_ready_signal.disconnect(self.data_ready)
+        except:
+            pass
+
+        if param.parent().parent().name()=='channels':
+            self.emit_status(ThreadCommand("Update_Status",['Updating Settings, please wait']))
+            channel=picoscope.DAQ_Picoscope_trigger_channel[param.parent().name()].value
+            enable_state=param.parent().child(('active')).value()
+            coupling_type=picoscope.DAQ_Picoscope_coupling[param.parent().child(('coupling')).value()].value
+            ch_range=picoscope.DAQ_Picoscope_range[param.parent().child(('range')).value()].value
+            analog_offset=param.parent().child(('offset')).value()
+            status=self.pico.setChannels(channel,enable_state,coupling_type,ch_range,analog_offset)  
+            if status!="PICO_OK":
+                self.emit_status(ThreadCommand('Update_Status',[status,'log']))
+            self.set_buffers()
+
+        elif param.name()=='Nsegments':
+            #set number of segments
+            status,NmaxSamples=self.pico.setSegments(param.value())
+            if status=="PICO_OK":
+                Nactive_channels=len(self.get_active_channels())
+                if NmaxSamples/Nactive_channels<self.settings.child('main_settings','temporal','Nsamples').value(): #the available samples have to be distributed among the active channels
+                    self.settings.child('main_settings','temporal','Nsamples').setValue(int(NmaxSamples/Nactive_channels))
+            self.set_buffers()
+
+        elif param.parent().name()=='trigger':
+            #set picoscope trigger
+            trigger_enabled=self.settings.child('main_settings','trigger','trig_enabled').value() 
+            trigger_channel=picoscope.DAQ_Picoscope_trigger_channel[self.settings.child('main_settings','trigger','trig_channel').value()].value
+            trigger_level=self.settings.child('main_settings','trigger','trig_level').value()
+            trigger_type=picoscope.DAQ_Picoscope_trigger_type[self.settings.child('main_settings','trigger','trig_type').value()].name
+            delay_sample=self.settings.child('main_settings','trigger','trig_delay').value()*1e-3#in s
+            autoTrigger_ms=self.settings.child('main_settings','trigger','trig_autotrig').value()
+            status=self.pico.set_simple_trigger(trigger_enabled,trigger_channel,trigger_level,trigger_type,delay_sample,autoTrigger_ms)
+            if status!="PICO_OK":
+                self.emit_status(ThreadCommand('Update_Status',[status,'log']))
+
+        elif param.parent().name()=='temporal':
+            window_ms=self.settings.child('main_settings','temporal','window').value() 
+            self.x_axis,self.Nsample_available=self.get_xaxis(self.settings.child('main_settings','temporal','Nsamples').value(),window_ms*1000) #get time axis in ms
+            self.settings.child('main_settings','temporal','window').setValue(np.max(self.x_axis)-np.min(self.x_axis))
+            self.settings.child('main_settings','temporal','resolution').setValue(self.x_axis[1]-self.x_axis[0])
+            
+            # self.emit_x_axis()
+            self.settings.child('main_settings','temporal','Nsamples').setValue(self.Nsample_available)
+            self.set_buffers()
+
+        elif param.name()=='dynamic':
+            self.set_channels_to_dynamic_range(param.value())
+            self.ini_detector()
+
+        self.pico.data_ready_signal.connect(self.data_ready)
+
+    def update_pico_settings(self):
+        """
+            | Update the Picoscope from the settings tree values.
+            | 
+
+            The update is made on 4 times :
+                * **Communication channels** update
+                * **Number of segments** update
+                * **Trigger** update
+                * **Temporal** update
+
+            | 
+            | Send the data ready signal once done.
+
+            See Also
+            --------
+            commit_settings, set_buffers, data_ready
+        """
+        try:
+            self.pico.data_ready_signal.disconnect(self.data_ready)
+        except:
+            pass
+        #set channels
+        self.commit_settings(self.settings.child('channels','ChA','active'))
+        self.commit_settings(self.settings.child('channels','ChB','active'))
+        self.commit_settings(self.settings.child('channels','ChC','active'))
+        self.commit_settings(self.settings.child('channels','ChD','active'))
+        self.commit_settings(self.settings.child('channels','ChE','active'))
+        self.commit_settings(self.settings.child('channels','ChF','active'))
+        self.commit_settings(self.settings.child('channels','ChG','active'))
+        self.commit_settings(self.settings.child('channels','ChH','active'))
+
+        #set segments
+        self.commit_settings(self.settings.child('main_settings','Nsegments'))
+
+        #set trigger
+        self.commit_settings(self.settings.child('main_settings','trigger','trig_channel'))
+
+        #get x_axis
+        self.commit_settings(self.settings.child('main_settings','temporal','window'))
+
+        #set buffers
+        self.set_buffers()
+                
+        self.pico.data_ready_signal.connect(self.data_ready)
+
+    def set_channels_to_dynamic_range(self,dynamic_range = "12bits"):
+        """
+            | Update the settings tree from the given dynamic_range value.
+            | 
+            
+            The dynamic range values are included in :
+                * **8** bits
+                * **12** bits
+                * **14** bits
+                * **15** bits
+                * **16** bits
+
+            =============== ========= =========================================
+            **Parameters**   **Type**  **Description**
+            *dynamic_range*  string    The dynamic range in number of bit form.
+            =============== ========= =========================================
+        """
+        if dynamic_range=='8bits' or dynamic_range=='12bits' or dynamic_range=='14bits':
+            self.settings.child('channels','ChA').setOpts(visible=True)
+            self.settings.child('channels','ChB').setOpts(visible=True)
+            self.settings.child('channels','ChC').setOpts(visible=True)
+            self.settings.child('channels','ChD').setOpts(visible=True)
+            self.settings.child('channels','ChE').setOpts(visible=True)
+            self.settings.child('channels','ChF').setOpts(visible=True)
+            self.settings.child('channels','ChG').setOpts(visible=True)
+            self.settings.child('channels','ChH').setOpts(visible=True)
+
+        elif dynamic_range=='15bits':
+            self.settings.child('channels','ChC').setOpts(visible=False)
+            self.settings.child('channels','ChC','active').setValue(False)
+            self.settings.child('channels','ChD').setOpts(visible=False)
+            self.settings.child('channels','ChD','active').setValue(False)
+
+        elif dynamic_range=='16bits':
+            self.settings.child('channels','ChB').setOpts(visible=False)
+            self.settings.child('channels','ChB','active').setValue(False)
+            self.settings.child('channels','ChC').setOpts(visible=False)
+            self.settings.child('channels','ChC','active').setValue(False)
+            self.settings.child('channels','ChD').setOpts(visible=False)
+            self.settings.child('channels','ChD','active').setValue(False)
 
     def ini_detector(self, controller=None):
-        """Detector communication initialization
-
-        Parameters
-        ----------
-        controller: (object)
-            custom object of a PyMoDAQ plugin (Slave case). None if only one actuator/detector by controller
-            (Master case)
-
-        Returns
-        -------
-        info: str
-        initialized: bool
-            False if initialization failed otherwise True
         """
+            Initialisation procedure of the detector with Picoscope 5000A profile.
 
-        raise NotImplemented  # TODO when writing your own plugin remove this line and modify the one below
-        self.ini_detector_init(slave_controller=controller)
+            See Also
+            --------
+            daq_utils.ThreadCommand, update_pico_settings
+        """
+        self.status.update(edict(initialized=False,info="",x_axis=None,y_axis=None,controller=None))
+        try:
+            if self.settings.child(('controller_status')).value()=="Slave":
+                if controller is None: 
+                    raise Exception('no controller has been defined externally while this detector is a slave one')
+                else:
+                    self.pico=controller
+                    try:
+                        self.pico.stop()
+                        status=self.pico.close_unit()
+                    except:
+                        pass
+            else:
+                self.pico=picoscope.picoscope()
+            status=self.pico.open_unit(None, dynamic_range = picoscope.DAQ_Picoscope_dynamic[self.settings.child('main_settings','dynamic').value()].value)
+            if status=="PICO_OK":
+                self.update_pico_settings()
+                self.pico.overflow_signal.connect(self.set_overflow)
+                self.status.initialized=True
+                self.status.controller=self.pico
+                return self.status
+            else:
+                #self.emit_status(ThreadCommand('Update_Status',[status[0],'log']))
+                self.status.info=status[0]
+                self.status.initialized=False
+                return self.status
 
-        if self.is_master:
-            self.controller = PythonWrapperOfYourInstrument()  #instantiate you driver with whatever arguments are needed
-            self.controller.open_communication() # call eventual methods
+        except Exception as e:
+            self.emit_status(ThreadCommand('Update_Status',[getLineInfo()+ str(e),'log']))
+            self.status.info=getLineInfo()+ str(e)
+            self.status.initialized=False
+            return self.status
 
-        ## TODO for your custom plugin
-        # get the x_axis (you may want to to this also in the commit settings if x_axis may have changed
-        data_x_axis = self.controller.your_method_to_get_the_x_axis()  # if possible
-        self.x_axis = Axis(data=data_x_axis, label='', units='', index=0)
+    @Slot(int)
+    def set_overflow(self,ind):
+        """
+            =============== ========== ==========================================================================================
+            **Parameters**   **Type**   **Description**
+            *ind*            int         the integer value of overflow threshold to be converted to the Picoscope trigger channel
+            =============== ========== ==========================================================================================
+        """
+        try:
+            bits=BitArray(int=ind,length=4).bin
+            for ind,char in enumerate(bits):
+                self.settings.child('main_settings','channels',picoscope.DAQ_Picoscope_trigger_channel(ind).name,'overflow').setValue(bool(char))
+        except:
+            pass
 
-        # TODO for your custom plugin. Initialize viewers pannel with the future type of data
-        self.dte_signal_temp.emit(DataToExport(name='myplugin',
-                                               data=[DataFromPlugins(name='Mock1',
-                                                                     data=[np.array([0., 0., ...]),
-                                                                           np.array([0., 0., ...])],
-                                                                     dim='Data1D', labels=['Mock1', 'label2'],
-                                                                     axes=[self.x_axis])]))
+    def set_buffers(self):
+        """
+            Set and populate the buffer from the active communication channels of the Picoscope 5000A.
 
-        info = "Whatever info you want to log"
-        initialized = True
-        return info, initialized
+            See Also
+            --------
+            daq_utils.ThreadCommand, get_active_channels
+        """
+        #set buffers
+        self.buffers=[]
+        channels=self.get_active_channels()
+
+        for ind_segment in range(self.settings.child('main_settings','Nsegments').value()):
+            buffer_tmp=[]
+            for channel in channels:
+                ind_channel=picoscope.DAQ_Picoscope_trigger_channel[channel].value
+                status=self.pico.set_buffer(self.Nsample_available,channel=ind_channel,ind_segment=ind_segment,downsampling_mode=0)
+                if status[0]!="PICO_OK":
+                    self.emit_status(ThreadCommand('Update_Status',[status[0],'log']))
+                else:
+                    buffer_tmp.append(status[1])
+
+            self.buffers.append(buffer_tmp)
 
     def close(self):
-        """Terminate the communication protocol"""
-        ## TODO for your custom plugin
-        raise NotImplemented  # when writing your own plugin remove this line
-        #  self.controller.your_method_to_terminate_the_communication()  # when writing your own plugin replace this line
-
-    def grab_data(self, Naverage=1, **kwargs):
-        """Start a grab from the detector
-
-        Parameters
-        ----------
-        Naverage: int
-            Number of hardware averaging (if hardware averaging is possible, self.hardware_averaging should be set to
-            True in class preamble and you should code this implementation)
-        kwargs: dict
-            others optionals arguments
         """
-        ## TODO for your custom plugin: you should choose EITHER the synchrone or the asynchrone version following
-
-        ##synchrone version (blocking function)
-        data_tot = self.controller.your_method_to_start_a_grab_snap()
-        self.dte_signal.emit(DataToExport('myplugin',
-                                          data=[DataFromPlugins(name='Mock1', data=data_tot,
-                                                                dim='Data1D', labels=['dat0', 'data1'],
-                                                                axes=[self.x_axis])]))
-
-        ##asynchrone version (non-blocking function with callback)
-        self.controller.your_method_to_start_a_grab_snap(self.callback)
-        #########################################################
-
-
-    def callback(self):
-        """optional asynchrone method called when the detector has finished its acquisition of data"""
-        data_tot = self.controller.your_method_to_get_data_from_buffer()
-        self.dte_signal.emit(DataToExport('myplugin',
-                                          data=[DataFromPlugins(name='Mock1', data=data_tot,
-                                                                dim='Data1D', labels=['dat0', 'data1'])]))
+            close the current instance of Picoscope 5000A.
+        """
+        try:
+            self.pico.stop()
+            status=self.pico.close_unit()
+        except:
+            pass
 
     def stop(self):
-        """Stop the current grab hardware wise if necessary"""
-        ## TODO for your custom plugin
-        raise NotImplemented  # when writing your own plugin remove this line
-        self.controller.your_method_to_stop_acquisition()  # when writing your own plugin replace this line
-        self.emit_status(ThreadCommand('Update_Status', ['Some info you want to log']))
-        ##############################
-        return ''
+        """
+            stop actions on Picoscope 5000A.
+        """
+        self.pico.stop()
+        return ""
 
+    def grab_data(self, Naverage=1, **kwargs):#for rapid block mode
+        """
+            | Start a new acquisition.
+            | 
+            | grab the current values with Picoscope 5000A profile procedure.
+
+            =============== ======== ===============================================
+            **Parameters**  **Type**  **Description**
+            *Naverage*      int       Number of spectrum to average
+            =============== ======== ===============================================
+
+            Returns
+            -------
+            string list
+                the updated status.
+
+            See Also
+            --------
+            daq_utils.ThreadCommand 
+        """
+        try:
+            self.Naverage=Naverage
+            N_pre_trigger=int(self.Nsample_available*self.settings.child('main_settings','trigger','trig_pretrigger').value()/100)
+            N_post_trigger=self.Nsample_available-N_pre_trigger
+            status=self.pico.setNoOfCapture(self.settings.child('main_settings','Nsegments').value())
+            if status!="PICO_OK":
+                self.emit_status(ThreadCommand("Update_Status",[status,'log']))
+            status=self.pico.run_block(N_pre_trigger,N_post_trigger,ind_segment=0)
+            if status[0]=="PICO_OK":
+                self.pico.check_isready()     
+                # new function querries hardware until its ready 
+                # more reliable than waiting with Qthread - it sometimes crashes using that
+                # if type(status[1])==int:
+                #     QThread.msleep(status[1])
+            return status
+        except Exception as e:
+            self.emit_status(ThreadCommand("Update_Status",[getLineInfo()+ str(e),'log']))
+
+    @Slot()
+    def data_ready(self):
+        """ 
+            | Cast the raw data (from Picoscope's communication channel) to export considering time axis in ms.
+            | Send the data grabed signal once done.
+
+            See Also
+            --------
+            get_active_channels, daq_utils.ThreadCommand
+        """
+        try:
+            Nsegments=self.settings.child('main_settings','Nsegments').value()
+            channels=self.get_active_channels()
+            ind_channels=[picoscope.DAQ_Picoscope_trigger_channel[channel].value for channel in channels]
+            data=np.zeros((len(channels),self.Nsample_available,Nsegments))
+            status,Nsamples=self.pico.get_value_bulk(Nsamples_required=self.Nsample_available,start_segment=0,stop_segment=Nsegments-1)
+            if status!="PICO_OK":
+                self.emit_status(ThreadCommand("Update_Status",[status,'log']))
+            window_ms=self.settings.child('main_settings','temporal','window').value() 
+            self.x_axis,self.Nsample_available=self.get_xaxis(self.settings.child('main_settings','temporal','Nsamples').value(),window_ms*1000) #get time axis in ms
+            # self.emit_x_axis()
+
+            for ind_segment in range(Nsegments):
+                for ind,ind_channel in enumerate(ind_channels):
+                    status,data_channel=self.pico.get_data(channel=ind_channel,buffer=self.buffers[ind_segment][ind])
+                    data[ind,:,ind_segment]=data_channel['data']
+            data_export=[np.sum(data[ind,:,:],axis=1)/Nsegments for ind in range(len(channels))]
+            self.data_grabed_signal.emit([DataFromPlugins(name='picoscope',data=data_export, dim='Data1D')])
+                
+        except Exception as e:
+            self.emit_status(ThreadCommand("Update_Status",[getLineInfo()+ str(e),'log']))
 
 if __name__ == '__main__':
     main(__file__)
