@@ -6,7 +6,7 @@ from pymodaq.utils.daq_utils import ThreadCommand, getLineInfo
 from bitstring import BitArray
 from pymodaq.utils.data import Axis, DataFromPlugins
 
-import Picoscope as picoscope
+import pymodaq_plugins_picotechnology.src.pymodaq_plugins_picotechnology.hardware.Picoscope as picoscope
 
 class DAQ_1DViewer_Picoscope(DAQ_Viewer_base):
     """
